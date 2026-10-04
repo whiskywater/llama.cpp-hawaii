@@ -8,6 +8,10 @@ ggml_add_backend_library(${TARGET_NAME}
                          cl-program-cache.cpp
                          cl-program-cache.h
                          ../../include/ggml-opencl.h)
+if (WIN32)
+    target_sources(${TARGET_NAME} PRIVATE hawaii-low-address.c)
+endif ()
+
 target_link_libraries(${TARGET_NAME} PRIVATE ${OpenCL_LIBRARIES})
 target_include_directories(${TARGET_NAME} PRIVATE ${OpenCL_INCLUDE_DIRS})
 

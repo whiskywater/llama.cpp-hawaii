@@ -1,4 +1,6 @@
+#ifndef GGML_OPENCL_F32_ONLY
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
+#endif
 
 #ifdef cl_intel_subgroups
 #pragma OPENCL EXTENSION cl_intel_subgroups : enable
@@ -44,6 +46,10 @@ typedef struct {
 #define N_SIMDGROUP 1 // number of SIMD groups in a thread group
 #define N_SIMDWIDTH 16 // SIMD group size
 #elif defined (ADRENO_GPU)
+#define N_DST 16
+#define N_SIMDGROUP 2
+#define N_SIMDWIDTH 64
+#elif defined (GGML_OPENCL_HAWAII)
 #define N_DST 16
 #define N_SIMDGROUP 2
 #define N_SIMDWIDTH 64
@@ -175,8 +181,8 @@ kernel void kernel_mul_mv_q4_K_f32_flat(
             acc2.s2 = yh[8]*(v0&0x00F0) + yh[10]*(v1&0x00F0) + yh[12]*(v2&0x00F0) + yh[14]*(v3&0x00F0);
             acc2.s3 = yh[9]*(v0&0xF000) + yh[11]*(v1&0xF000) + yh[13]*(v2&0xF000) + yh[15]*(v3&0xF000);
 
-            float dall = *d;
-            float dmin = *dm;
+            float dall = vload_half(0, d);
+            float dmin = vload_half(0, dm);
             sumf[row] += dall * ((acc1.s0 + 1.f/256.f * acc1.s1) * sc8[0] +
                                  (acc1.s2 + 1.f/256.f * acc1.s3) * sc8[1] * 1.f/16.f +
                                  (acc2.s0 + 1.f/256.f * acc2.s1) * sc8[4] +

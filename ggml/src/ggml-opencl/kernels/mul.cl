@@ -1,4 +1,6 @@
+#ifndef GGML_OPENCL_F32_ONLY
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
+#endif
 
 //------------------------------------------------------------------------------
 // mul
@@ -78,6 +80,7 @@ kernel void kernel_mul_row(
     dst[gid] = src0[gid] * src1[idx1];
 }
 
+#ifndef GGML_OPENCL_F32_ONLY
 kernel void kernel_mul_f16(
         global char * src0,
         ulong offset0,
@@ -150,3 +153,5 @@ kernel void kernel_mul_row_f16(
     uint idx1 = gid - (gid/ne)*ne; // get_global_id(0) % ne
     dst[gid] = src0[gid] * src1[idx1];
 }
+
+#endif

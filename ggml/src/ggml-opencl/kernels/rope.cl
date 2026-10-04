@@ -1,4 +1,6 @@
+#ifndef GGML_OPENCL_F32_ONLY
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
+#endif
 
 //------------------------------------------------------------------------------
 // kernel_rope
@@ -101,7 +103,7 @@ kernel void kernel_rope_norm_f32(
 
             float theta = theta_base * pow(freq_base, inv_ndims*iw);
 
-            float freq_factor = src2 != src0 ? src2[ic] : 1.0f;
+            float freq_factor = offset2 != offset0 ? src2[ic] : 1.0f;
 
             float2 cos_sin_theta = rope_yarn(theta/freq_factor, freq_scale, corr_dims, iw, ext_factor, attn_factor);
 
@@ -123,6 +125,7 @@ kernel void kernel_rope_norm_f32(
     }
 }
 
+#ifndef GGML_OPENCL_F32_ONLY
 kernel void kernel_rope_norm_f16(
         global void * src0,
         ulong offset0,
@@ -182,7 +185,7 @@ kernel void kernel_rope_norm_f16(
 
             float theta = theta_base * pow(freq_base, inv_ndims*iw);
 
-            float freq_factor = src2 != src0 ? src2[ic] : 1.0f;
+            float freq_factor = offset2 != offset0 ? src2[ic] : 1.0f;
 
             float2 cos_sin_theta = rope_yarn(theta/freq_factor, freq_scale, corr_dims, iw, ext_factor, attn_factor);
 
@@ -203,6 +206,7 @@ kernel void kernel_rope_norm_f16(
         }
     }
 }
+#endif
 
 kernel void kernel_rope_neox_f32(
         global void * src0,
@@ -263,7 +267,7 @@ kernel void kernel_rope_neox_f32(
 
             const float theta = theta_base * pow(freq_base, inv_ndims*iw);
 
-            const float freq_factor = src2 != src0 ? src2[ic] : 1.0f;
+            const float freq_factor = offset2 != offset0 ? src2[ic] : 1.0f;
 
             float2 cos_sin_theta = rope_yarn(theta/freq_factor, freq_scale, corr_dims, iw, ext_factor, attn_factor);
 
@@ -285,6 +289,7 @@ kernel void kernel_rope_neox_f32(
     }
 }
 
+#ifndef GGML_OPENCL_F32_ONLY
 kernel void kernel_rope_neox_f16(
         global void * src0,
         ulong offset0,
@@ -344,7 +349,7 @@ kernel void kernel_rope_neox_f16(
 
             const float theta = theta_base * pow(freq_base, inv_ndims*iw);
 
-            const float freq_factor = src2 != src0 ? src2[ic] : 1.0f;
+            const float freq_factor = offset2 != offset0 ? src2[ic] : 1.0f;
 
             float2 cos_sin_theta = rope_yarn(theta/freq_factor, freq_scale, corr_dims, iw, ext_factor, attn_factor);
 
@@ -365,6 +370,7 @@ kernel void kernel_rope_neox_f16(
         }
     }
 }
+#endif
 
 kernel void kernel_rope_multi_f32(
         global void * src0,
@@ -457,7 +463,7 @@ kernel void kernel_rope_multi_f32(
 
             const float theta = theta_base * pow(freq_base, inv_ndims*iw);
 
-            const float freq_factor = src2 != src0 ? src2[ic] : 1.0f;
+            const float freq_factor = offset2 != offset0 ? src2[ic] : 1.0f;
 
             float2 cos_sin_theta = rope_yarn(theta/freq_factor, freq_scale, corr_dims, iw, ext_factor, attn_factor);
 
@@ -479,6 +485,7 @@ kernel void kernel_rope_multi_f32(
     }
 }
 
+#ifndef GGML_OPENCL_F32_ONLY
 kernel void kernel_rope_multi_f16(
         global void * src0,
         ulong offset0,
@@ -591,6 +598,7 @@ kernel void kernel_rope_multi_f16(
         }
     }
 }
+#endif
 
 kernel void kernel_rope_vision_f32(
         global void * src0,
@@ -660,7 +668,7 @@ kernel void kernel_rope_vision_f32(
             theta_base = pos[i2 + ne2] * pow(freq_base, inv_ndims*2.0f*p);
         }
 
-        const float freq_factor = src2 != src0 ? src2[ic] : 1.0f;
+        const float freq_factor = offset2 != offset0 ? src2[ic] : 1.0f;
 
         float2 cos_sin_theta = rope_yarn(theta_base/freq_factor, freq_scale, corr_dims, i0, ext_factor, attn_factor);
 
@@ -675,6 +683,7 @@ kernel void kernel_rope_vision_f32(
     }
 }
 
+#ifndef GGML_OPENCL_F32_ONLY
 kernel void kernel_rope_vision_f16(
         global void * src0,
         ulong offset0,
@@ -757,3 +766,4 @@ kernel void kernel_rope_vision_f16(
         dst_data[n_dims] = x0*cos_sin_theta.s1 + x1*cos_sin_theta.s0;
     }
 }
+#endif

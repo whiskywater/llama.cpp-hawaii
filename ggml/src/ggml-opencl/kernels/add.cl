@@ -1,4 +1,6 @@
+#ifndef GGML_OPENCL_F32_ONLY
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
+#endif
 
 //------------------------------------------------------------------------------
 // add
@@ -82,6 +84,7 @@ kernel void kernel_add_row(
     dst[gid] = src0[gid] + src1[idx1];
 }
 
+#ifndef GGML_OPENCL_F32_ONLY
 kernel void kernel_add_f16(
         global char * src0,
         ulong  offset0,
@@ -188,3 +191,5 @@ kernel void kernel_add_row_f16(
 
     dst[gid] = v0 + v1;
 }
+
+#endif

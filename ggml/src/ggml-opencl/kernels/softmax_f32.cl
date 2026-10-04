@@ -1,4 +1,6 @@
+#ifndef GGML_OPENCL_F32_ONLY
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
+#endif
 
 #ifdef cl_intel_subgroups
 #pragma OPENCL EXTENSION cl_intel_subgroups : enable

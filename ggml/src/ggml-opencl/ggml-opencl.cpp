@@ -15,6 +15,10 @@
 
 #include "cl-program-cache.h"
 
+#ifdef _WIN32
+#include "hawaii-low-address.h"
+#endif
+
 #ifdef GGML_OPENCL_USE_ADRENO_BIN_KERNELS
 #include "libdl.h"
 #ifdef _WIN32
@@ -112,6 +116,7 @@ static fastdiv_vals init_fastdiv_values(uint64_t d_64) {
 enum GPU_FAMILY {
     ADRENO,
     INTEL,
+    HAWAII,
     UNKNOWN,
 };
 
@@ -946,6 +951,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_mul_mv_q5_1_f32_flat;
     cl_kernel kernel_mul_mv_q4_K_f32;
     cl_kernel kernel_mul_mv_q4_K_f32_flat;
+    cl_kernel kernel_mul_mat_id_q4_K_f32_hawaii = nullptr;
     cl_kernel kernel_mul_mv_q5_K_f32;
     cl_kernel kernel_mul_mv_q5_K_f32_flat;
     cl_kernel kernel_mul_mv_q6_K_f32;
@@ -1488,6 +1494,195 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
     }
 
     backend_ctx->kernel_compile_opts = compile_opts;
+
+    if (backend_ctx->gpu_family == GPU_FAMILY::HAWAII) {
+        // Compile only the operations admitted by the Hawaii support gate.
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string add_src {
+            #include "add.cl.h"
+        };
+        const std::string mul_src {
+            #include "mul.cl.h"
+        };
+        const std::string rms_norm_src {
+            #include "rms_norm.cl.h"
+        };
+        const std::string rope_src {
+            #include "rope.cl.h"
+        };
+        const std::string softmax_src {
+            #include "softmax_f32.cl.h"
+        };
+        const std::string softmax_4_src {
+            #include "softmax_4_f32.cl.h"
+        };
+        const std::string scale_src {
+            #include "scale.cl.h"
+        };
+        const std::string cpy_src {
+            #include "cpy.cl.h"
+        };
+        const auto extract_kernel = [](const std::string & src, const char * name) {
+            const size_t begin = src.find(name);
+            const size_t end = src.find("\nkernel void ", begin + 1);
+            return src.substr(begin, end == std::string::npos ? std::string::npos : end - begin);
+        };
+        const std::string cpy_f32_src =
+            extract_kernel(cpy_src, "kernel void kernel_cpy_f32_f32(") +
+            extract_kernel(cpy_src, "kernel void kernel_cpy_f32_f32_pack(");
+        const std::string q4k_src {
+            #include "mul_mv_q4_k_f32_flat.cl.h"
+        };
+        const std::string q4k_id_src = R"CLC(
+#define QK_K 256
+#define K_SCALE_SIZE 12
+inline void q4k_scale_min(global uchar * scales, int j, uint * sc, uint * mn) {
+    if (j < 4) {
+        *sc = scales[j] & 63;
+        *mn = scales[j + 4] & 63;
+    } else {
+        *sc = (scales[j + 4] & 15) | ((scales[j - 4] >> 6) << 4);
+        *mn = (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4);
+    }
+}
+kernel void kernel_mul_mat_id_q4_K_f32_hawaii(
+    global uchar * src0_q, global uchar * src0_s,
+    global half * src0_d, global half * src0_dm,
+    global char * src1, ulong offset1,
+    global char * src2, ulong offset2,
+    global char * dst, ulong offsetd,
+    int ne00, int ne01, int ne02,
+    int ne11, int ne12, int ne20, int ne21,
+    ulong nb11, ulong nb12,
+    ulong nb20, ulong nb21,
+    ulong nb1, ulong nb2,
+    int ne0) {
+    const int row = (int) get_global_id(0);
+    const int slot = (int) get_global_id(1);
+    const int token = (int) get_global_id(2);
+    if (row >= ne01 || slot >= ne20 || token >= ne21) return;
+
+    global int * ids = (global int *)(src2 + offset2 + (ulong) slot * nb20 + (ulong) token * nb21);
+    const int expert = ids[0];
+    if (expert < 0 || expert >= ne02) return;
+
+    const int src_slot = slot % ne11;
+    const int src_token = token % ne12;
+    global float * x = (global float *)(src1 + offset1 + (ulong) src_slot * nb11 + (ulong) src_token * nb12);
+    global float * out = (global float *)(dst + offsetd + (ulong) slot * nb1 + (ulong) token * nb2);
+
+    const int nblocks = ne00 / QK_K;
+    float sum = 0.0f;
+    for (int ib = 0; ib < nblocks; ++ib) {
+        const int block = (expert * ne01 + row) * nblocks + ib;
+        global uchar * q = src0_q + (ulong) block * (QK_K / 2);
+        global uchar * scales = src0_s + (ulong) block * K_SCALE_SIZE;
+        const float d = vload_half(0, src0_d + block);
+        const float dm = vload_half(0, src0_dm + block);
+        for (int j = 0; j < QK_K; ++j) {
+            const int group = j / 64;
+            const int pair = (j % 64) / 32;
+            const int l = j % 32;
+            const uchar qb = q[group * 32 + l];
+            const uint qv = pair == 0 ? (qb & 15) : (qb >> 4);
+            uint sc, mn;
+            q4k_scale_min(scales, group * 2 + pair, &sc, &mn);
+            sum += x[ib * QK_K + j] * (d * (float) sc * (float) qv - dm * (float) mn);
+        }
+    }
+    out[row] = sum;
+}
+)CLC";
+        const std::string cvt_src = R"CLC(
+#define QK_K 256
+#define K_SCALE_SIZE 12
+kernel void kernel_convert_block_q4_K(
+    global uchar * src0, global uchar * dst_q, global uchar * dst_s,
+    global ushort * dst_d, global ushort * dst_dm, uchar mask_0F, uchar mask_F0) {
+    const size_t i = get_global_id(0);
+    global uchar * b = src0 + i * 144;
+    dst_d[i] = *((global ushort *)(b + 0));
+    dst_dm[i] = *((global ushort *)(b + 2));
+    for (int j = 0; j < K_SCALE_SIZE; ++j) dst_s[i * K_SCALE_SIZE + j] = b[4 + j];
+    for (int j = 0; j < QK_K / 2; ++j) dst_q[i * (QK_K / 2) + j] = b[16 + j];
+}
+kernel void kernel_restore_block_q4_K(
+    global uchar * src_q, global uchar * src_s,
+    global ushort * src_d, global ushort * src_dm, global uchar * dst,
+    uchar mask_0F, uchar mask_F0) {
+    const size_t i = get_global_id(0);
+    global uchar * b = dst + i * 144;
+    *((global ushort *)(b + 0)) = src_d[i];
+    *((global ushort *)(b + 2)) = src_dm[i];
+    for (int j = 0; j < K_SCALE_SIZE; ++j) b[4 + j] = src_s[i * K_SCALE_SIZE + j];
+    for (int j = 0; j < QK_K / 2; ++j) b[16 + j] = src_q[i * (QK_K / 2) + j];
+}
+)CLC";
+        const std::string set_rows_src = R"CLC(
+inline void set_rows_f32(global char *src0, ulong o0, global char *src1, ulong o1, global char *dst, ulong od,
+ int ne01, ulong nb01, ulong nb02, ulong nb03, uint4 ne11, uint4 ne12, ulong nb10, ulong nb11, ulong nb12,
+ int nblk0, ulong nb1, ulong nb2, ulong nb3, int use_i64) {
+ src0 += o0; src1 += o1; dst += od;
+ int i03=get_group_id(2), i02=get_group_id(1), i01=get_group_id(0)*get_local_size(1)+get_local_id(1);
+ if(i01>=ne01) return; int i12=i03%((int)ne12.x), i11=i02%((int)ne11.x), i10=i01;
+ long i1 = use_i64 ? ((global long *)(src1+i10*nb10+i11*nb11+i12*nb12))[0] : (long)((global int *)(src1+i10*nb10+i11*nb11+i12*nb12))[0];
+ global float *dr=(global float *)(dst+i1*nb1+i02*nb2+i03*nb3); global float *sr=(global float *)(src0+i01*nb01+i02*nb02+i03*nb03);
+ for(int ind=get_local_id(0); ind<nblk0; ind+=get_local_size(0)) dr[ind]=sr[ind];
+}
+kernel void kernel_set_rows_f32_i64(global char*a,ulong b,global char*c,ulong d,global char*e,ulong f,int g,ulong h,ulong i,ulong j,uint4 k,uint4 l,ulong m,ulong n,ulong o,int p,ulong q,ulong r,ulong s){set_rows_f32(a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p,q,r,s,1);}
+kernel void kernel_set_rows_f32_i32(global char*a,ulong b,global char*c,ulong d,global char*e,ulong f,int g,ulong h,ulong i,ulong j,uint4 k,uint4 l,ulong m,ulong n,ulong o,int p,ulong q,ulong r,ulong s){set_rows_f32(a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p,q,r,s,0);}
+kernel void kernel_set_rows_f16_i64(global char*a,ulong b,global char*c,ulong d,global char*e,ulong f,int g,ulong h,ulong i,ulong j,uint4 k,uint4 l,ulong m,ulong n,ulong o,int p,ulong q,ulong r,ulong s){
+ a+=b;c+=d;e+=f;int i03=get_group_id(2),i02=get_group_id(1),i01=get_group_id(0)*get_local_size(1)+get_local_id(1);if(i01>=g)return;int i12=i03%((int)l.x),i11=i02%((int)k.x);long i1=((global long*)(c+i01*m+i11*n+i12*o))[0];global half*dr=(global half*)(e+i1*q+i02*r+i03*s);global float*sr=(global float*)(a+i01*h+i02*i+i03*j);for(int x=get_local_id(0);x<p;x+=get_local_size(0))vstore_half(sr[x],0,dr+x);}
+kernel void kernel_set_rows_f16_i32(global char*a,ulong b,global char*c,ulong d,global char*e,ulong f,int g,ulong h,ulong i,ulong j,uint4 k,uint4 l,ulong m,ulong n,ulong o,int p,ulong q,ulong r,ulong s){
+ a+=b;c+=d;e+=f;int i03=get_group_id(2),i02=get_group_id(1),i01=get_group_id(0)*get_local_size(1)+get_local_id(1);if(i01>=g)return;int i12=i03%((int)l.x),i11=i02%((int)k.x);int i1=((global int*)(c+i01*m+i11*n+i12*o))[0];global half*dr=(global half*)(e+i1*q+i02*r+i03*s);global float*sr=(global float*)(a+i01*h+i02*i+i03*j);for(int x=get_local_id(0);x<p;x+=get_local_size(0))vstore_half(sr[x],0,dr+x);}
+)CLC";
+#else
+        const std::string add_src = read_file("add.cl");
+        const std::string mul_src = read_file("mul.cl");
+#endif
+        const std::string opts = "-cl-std=CL2.0 -DGGML_OPENCL_F32_ONLY=1 -DGGML_OPENCL_HAWAII=1";
+        backend_ctx->program_add = build_program_from_source(backend_ctx, add_src.c_str(), opts);
+        backend_ctx->program_mul = build_program_from_source(backend_ctx, mul_src.c_str(), opts);
+        backend_ctx->program_rms_norm = build_program_from_source(backend_ctx, rms_norm_src.c_str(), opts);
+        backend_ctx->program_rope = build_program_from_source(backend_ctx, rope_src.c_str(), opts);
+        backend_ctx->program_softmax_f32 = build_program_from_source(backend_ctx, softmax_src.c_str(), opts);
+        backend_ctx->program_softmax_4_f32 = build_program_from_source(backend_ctx, softmax_4_src.c_str(), opts);
+        cl_program scale_prog = build_program_from_source(backend_ctx, scale_src.c_str(), opts);
+        cl_program cpy_prog = build_program_from_source(backend_ctx, cpy_f32_src.c_str(), opts);
+        cl_program q4k_prog = build_program_from_source(backend_ctx, q4k_src.c_str(), opts);
+        backend_ctx->program_cvt = build_program_from_source(backend_ctx, cvt_src.c_str(), opts);
+        backend_ctx->program_set_rows = build_program_from_source(backend_ctx, set_rows_src.c_str(), opts);
+        CL_CHECK((backend_ctx->kernel_add = clCreateKernel(backend_ctx->program_add, "kernel_add", &err), err));
+        CL_CHECK((backend_ctx->kernel_add_row = clCreateKernel(backend_ctx->program_add, "kernel_add_row", &err), err));
+        CL_CHECK((backend_ctx->kernel_mul = clCreateKernel(backend_ctx->program_mul, "kernel_mul", &err), err));
+        CL_CHECK((backend_ctx->kernel_mul_row = clCreateKernel(backend_ctx->program_mul, "kernel_mul_row", &err), err));
+        CL_CHECK((backend_ctx->kernel_rms_norm = clCreateKernel(backend_ctx->program_rms_norm, "kernel_rms_norm", &err), err));
+        CL_CHECK((backend_ctx->kernel_rope_norm_f32 = clCreateKernel(backend_ctx->program_rope, "kernel_rope_norm_f32", &err), err));
+        CL_CHECK((backend_ctx->kernel_rope_neox_f32 = clCreateKernel(backend_ctx->program_rope, "kernel_rope_neox_f32", &err), err));
+        CL_CHECK((backend_ctx->kernel_rope_multi_f32 = clCreateKernel(backend_ctx->program_rope, "kernel_rope_multi_f32", &err), err));
+        CL_CHECK((backend_ctx->kernel_rope_vision_f32 = clCreateKernel(backend_ctx->program_rope, "kernel_rope_vision_f32", &err), err));
+        CL_CHECK((backend_ctx->kernel_soft_max = clCreateKernel(backend_ctx->program_softmax_f32, "kernel_soft_max", &err), err));
+        CL_CHECK((backend_ctx->kernel_soft_max_4 = clCreateKernel(backend_ctx->program_softmax_4_f32, "kernel_soft_max_4", &err), err));
+        CL_CHECK((backend_ctx->kernel_scale_f32 = clCreateKernel(scale_prog, "kernel_scale_f32", &err), err));
+        CL_CHECK((backend_ctx->kernel_scale_f32_4 = clCreateKernel(scale_prog, "kernel_scale_f32_4", &err), err));
+        CL_CHECK(clReleaseProgram(scale_prog));
+        CL_CHECK((backend_ctx->kernel_cpy_f32_f32 = clCreateKernel(cpy_prog, "kernel_cpy_f32_f32", &err), err));
+        CL_CHECK((backend_ctx->kernel_cpy_f32_f32_pack = clCreateKernel(cpy_prog, "kernel_cpy_f32_f32_pack", &err), err));
+        CL_CHECK(clReleaseProgram(cpy_prog));
+        CL_CHECK((backend_ctx->kernel_mul_mv_q4_K_f32_flat = clCreateKernel(q4k_prog, "kernel_mul_mv_q4_K_f32_flat", &err), err));
+        cl_program q4k_id_prog = build_program_from_source(backend_ctx, q4k_id_src.c_str(), opts);
+        CL_CHECK((backend_ctx->kernel_mul_mat_id_q4_K_f32_hawaii = clCreateKernel(q4k_id_prog, "kernel_mul_mat_id_q4_K_f32_hawaii", &err), err));
+        CL_CHECK(clReleaseProgram(q4k_id_prog));
+        CL_CHECK((backend_ctx->kernel_convert_block_q4_K = clCreateKernel(backend_ctx->program_cvt, "kernel_convert_block_q4_K", &err), err));
+        CL_CHECK((backend_ctx->kernel_restore_block_q4_K = clCreateKernel(backend_ctx->program_cvt, "kernel_restore_block_q4_K", &err), err));
+        CL_CHECK((backend_ctx->kernel_set_rows_f32_i64 = clCreateKernel(backend_ctx->program_set_rows, "kernel_set_rows_f32_i64", &err), err));
+        CL_CHECK((backend_ctx->kernel_set_rows_f32_i32 = clCreateKernel(backend_ctx->program_set_rows, "kernel_set_rows_f32_i32", &err), err));
+        CL_CHECK((backend_ctx->kernel_set_rows_f16_i64 = clCreateKernel(backend_ctx->program_set_rows, "kernel_set_rows_f16_i64", &err), err));
+        CL_CHECK((backend_ctx->kernel_set_rows_f16_i32 = clCreateKernel(backend_ctx->program_set_rows, "kernel_set_rows_f16_i32", &err), err));
+        CL_CHECK(clReleaseProgram(q4k_prog));
+        backend_ctx->kernels_loaded = true;
+        return;
+    }
 
     GGML_LOG_INFO("ggml_opencl: loading OpenCL kernels");
 
@@ -6443,17 +6638,8 @@ static std::vector<ggml_backend_device> ggml_opencl_probe_devices(ggml_backend_r
 
     GGML_LOG_INFO("ggml_opencl: selected platform: '%s'\n", default_device->platform->name);
 
-    std::vector<cl_device_id> device_ids;
-    for (auto dev = candidate_devices, dev_end = candidate_devices + n_candidate_devices; dev != dev_end; dev++) {
-        device_ids.push_back(dev->id);
-    }
-
     cl_int                err;
-    cl_context            shared_context;
     cl_context_properties properties[] = { (intptr_t) CL_CONTEXT_PLATFORM, (intptr_t) default_device->platform->id, 0 };
-
-    CL_CHECK(
-        (shared_context = clCreateContext(properties, device_ids.size(), device_ids.data(), NULL, NULL, &err), err));
 
     for (auto dev = candidate_devices, dev_end = candidate_devices + n_candidate_devices; dev != dev_end; dev++) {
         GGML_LOG_INFO("\nggml_opencl: device: '%s (%s)'\n", dev->name, dev->version);
@@ -6467,7 +6653,7 @@ static std::vector<ggml_backend_device> ggml_opencl_probe_devices(ggml_backend_r
             /*.device_version   =*/dev->version,
             /*.backend_ctx      =*/nullptr,
             /*.buffer_type      =*/{},
-            /*.context          =*/shared_context,
+            /*.context          =*/nullptr,
         });
 
         found_devices.push_back(ggml_backend_device{
@@ -6481,6 +6667,11 @@ static std::vector<ggml_backend_device> ggml_opencl_probe_devices(ggml_backend_r
             GGML_LOG_WARN("ggml_opencl: drop unsupported device '%s'.\n", dev->name);
             continue;
         }
+
+        // Create a context only after capability filtering.  In particular,
+        // do not place unsupported CPU OpenCL devices in Hawaii's context.
+        dev_ctx->context = clCreateContext(properties, 1, &dev->id, NULL, NULL, &err);
+        CL_CHECK(err);
 
         g_ggml_backend_opencl_dev_ctxs.push_back(std::move(dev_ctx));
     }
@@ -6588,6 +6779,9 @@ static bool ggml_opencl_is_device_supported(ggml_backend_dev_t dev) {
         }
     } else if (strstr(dev_ctx->device_name.c_str(), "Intel")) {
         dev_ctx->gpu_family = GPU_FAMILY::INTEL;
+    } else if (strstr(dev_ctx->device_name.c_str(), "Hawaii")) {
+        GGML_LOG_WARN("ggml_opencl: EXPERIMENTAL Hawaii F32-only compatibility path\n");
+        dev_ctx->gpu_family = GPU_FAMILY::HAWAII;
     } else {
         GGML_LOG_WARN("ggml_opencl: unsupported GPU '%s'.\n", dev_ctx->device_name.c_str());
         dev_ctx->gpu_family = GPU_FAMILY::UNKNOWN;
@@ -6620,7 +6814,7 @@ static bool ggml_opencl_is_device_supported(ggml_backend_dev_t dev) {
 
     // Check if ext_buffer contains cl_khr_fp16
     bool fp16_support = strstr(ext_buffer.data(), "cl_khr_fp16") != NULL;
-    if (!fp16_support) {
+    if (!fp16_support && dev_ctx->gpu_family != GPU_FAMILY::HAWAII) {
         GGML_LOG_WARN("ggml_opencl: device does not support FP16\n");
         return false;
     }
@@ -6841,6 +7035,14 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
 #ifdef GGML_OPENCL_PROFILING
     command_queue_props |= CL_QUEUE_PROFILING_ENABLE;
 #endif
+#ifdef _WIN32
+    if (backend_ctx->gpu_family == GPU_FAMILY::HAWAII &&
+        backend_ctx->driver_version.compare(0, 6, "1800.5") == 0) {
+        if (!ggml_opencl_install_hawaii_low_address_hook()) {
+            GGML_ABORT("Failed to install Hawaii low-address reservation workaround");
+        }
+    }
+#endif
     CL_CHECK((backend_ctx->queue = clCreateCommandQueue(context, device, command_queue_props, &err), err));
 
     // delay kernel loading until the first buffer is created
@@ -6874,7 +7076,8 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
     backend_ctx->prealloc_act_trans.allocate(context, max_B_d_bytes);
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
 
-    backend_ctx->disable_fusion = getenv("GGML_OPENCL_DISABLE_FUSION") != nullptr;
+    backend_ctx->disable_fusion = backend_ctx->gpu_family == GPU_FAMILY::HAWAII ||
+                                  getenv("GGML_OPENCL_DISABLE_FUSION") != nullptr;
     if (const char * env = getenv("GGML_OPENCL_FUSE_MM_GLU")) {
         backend_ctx->fuse_mm_glu = atoi(env) != 0;
     }
@@ -8838,6 +9041,88 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
     ggml_backend_opencl_device_context * dev_ctx     = (ggml_backend_opencl_device_context *)dev->context;
     ggml_backend_opencl_context *        backend_ctx = dev_ctx->backend_ctx;
 
+    if (dev_ctx->gpu_family == GPU_FAMILY::HAWAII) {
+        if (op->op == GGML_OP_NONE) {
+            return true;
+        }
+        if (op->op == GGML_OP_RESHAPE) {
+            return true;
+        }
+        if (op->op == GGML_OP_SCALE) {
+            return op->type == GGML_TYPE_F32 && op->src[0] && op->src[0]->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[0]);
+        }
+        if (op->op == GGML_OP_CPY) {
+            if (op->type != GGML_TYPE_F32 || !op->src[0] || op->src[0]->type != GGML_TYPE_F32 ||
+                !op->src[1] || op->src[1]->type != GGML_TYPE_F32 ||
+                ggml_nelements(op->src[0]) != ggml_nelements(op->src[1])) {
+                return false;
+            }
+            const bool contiguous = ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
+            const bool recurrent_view = op->src[0]->ne[2] == 1 && op->src[0]->ne[3] == 1 &&
+                                        op->src[1]->ne[2] == 1 && op->src[1]->ne[3] == 1 &&
+                                        op->src[0]->ne[1] > 1 && op->src[1]->ne[1] == 1 &&
+                                        op->src[0]->ne[0] < op->src[1]->ne[0];
+            const bool source_rows_with_padding = op->src[0]->ne[3] == 1 &&
+                                                  op->src[1]->ne[2] == 1 && op->src[1]->ne[3] == 1 &&
+                                                  op->src[0]->ne[0] > 0 && op->src[0]->ne[1] > 0 &&
+                                                  op->src[0]->ne[2] == op->src[1]->ne[1] &&
+                                                  op->src[1]->ne[0] > 0 &&
+                                                  op->src[1]->ne[0] % op->src[0]->ne[0] == 0 &&
+                                                  op->src[1]->ne[0] / op->src[0]->ne[0] == op->src[0]->ne[1] &&
+                                                  op->src[0]->nb[0] == sizeof(float) &&
+                                                  op->src[0]->nb[1] >= (size_t) op->src[0]->ne[0] * sizeof(float) &&
+                                                  op->src[0]->nb[2] == op->src[0]->nb[1] * (size_t) op->src[0]->ne[1] &&
+                                                  ggml_is_contiguous(op->src[1]);
+            return contiguous || recurrent_view || source_rows_with_padding;
+        }
+        if (op->op == GGML_OP_MUL_MAT) {
+            return op->src[0] && op->src[0]->type == GGML_TYPE_Q4_K && op->src[1] && op->src[1]->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
+        }
+        if (op->op == GGML_OP_MUL_MAT_ID) {
+            return op->src[0] && op->src[0]->type == GGML_TYPE_Q4_K &&
+                   op->src[1] && op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[2] && op->src[2]->type == GGML_TYPE_I32 &&
+                   ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
+        }
+        if (op->op == GGML_OP_SET_ROWS) {
+            return op->src[0] && op->src[0]->type == GGML_TYPE_F32 && (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) &&
+                   op->src[1] && (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32);
+        }
+        if (op->op == GGML_OP_VIEW) {
+            return true;
+        }
+        if (op->op == GGML_OP_PERMUTE) {
+            return true;
+        }
+        if (op->op == GGML_OP_TRANSPOSE) {
+            return true;
+        }
+        if (op->op != GGML_OP_NONE && op->op != GGML_OP_ADD && op->op != GGML_OP_MUL && op->op != GGML_OP_RMS_NORM && op->op != GGML_OP_ROPE && op->op != GGML_OP_SOFT_MAX) {
+            return false;
+        }
+        if (op->type != GGML_TYPE_F32 || !op->src[0] || op->src[0]->type != GGML_TYPE_F32) {
+            return false;
+        }
+        if (op->op == GGML_OP_RMS_NORM) {
+            return true;
+        }
+        if (op->op == GGML_OP_ROPE) {
+            return op->src[1] && op->src[1]->type == GGML_TYPE_I32 &&
+                   (!op->src[2] || op->src[2]->type == GGML_TYPE_F32);
+        }
+        if (op->op == GGML_OP_SOFT_MAX) {
+            return (!op->src[1] || op->src[1]->type == GGML_TYPE_F32) &&
+                   (!op->src[2] || op->src[2]->type == GGML_TYPE_F32);
+        }
+        for (const auto * src : op->src) {
+            if (src && src->type != GGML_TYPE_F32) {
+                return false;
+            }
+        }
+    }
+
     // reject ops that match the opfilter regex
     if (dev_ctx->opfilter && std::regex_match(std::string(ggml_op_desc(op)), *dev_ctx->opfilter)) {
         return false;
@@ -9106,6 +9391,12 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             }
             return false;
         case GGML_OP_MUL_MAT_ID:
+            if (backend_ctx->gpu_family == GPU_FAMILY::HAWAII &&
+                op->src[0]->type == GGML_TYPE_Q4_K &&
+                op->src[1]->type == GGML_TYPE_F32 &&
+                op->src[2]->type == GGML_TYPE_I32) {
+                return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]);
+            }
             if (op->src[0]->type == GGML_TYPE_Q4_0 ||
                 op->src[0]->type == GGML_TYPE_Q8_0 ||
                 op->src[0]->type == GGML_TYPE_MXFP4) {
@@ -15037,7 +15328,7 @@ static void ggml_cl_rms_norm(ggml_backend_t backend, const ggml_tensor * src0, c
     //    CL_KERNEL_MAX_SUB_GROUP_SIZE_FOR_NDRANGE,
     //    sizeof(local_work_size), local_work_size,
     //    sizeof(size_t), &sgs, NULL));
-    if (backend_ctx->gpu_family == ADRENO) {
+    if (backend_ctx->gpu_family == ADRENO || backend_ctx->gpu_family == HAWAII) {
         sgs = 64;
     } else if (backend_ctx->gpu_family == INTEL) {
         sgs = 32;
@@ -23866,7 +24157,11 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     // Override with GGML_OPENCL_A7X_F32_LM_BYPASS=0.
     static const char * a7x_f32lm_env    = getenv("GGML_OPENCL_A7X_F32_LM_BYPASS");
     static const bool   a7x_f32lm_bypass = (a7x_f32lm_env == nullptr || a7x_f32lm_env[0] != '0');
-    if (src1t == GGML_TYPE_F32 &&
+    // Hawaii's F32-only compatibility path deliberately does not compile the
+    // local-memory quant GEMM kernels.  Its Q4_K flat kernel below handles
+    // arbitrary prompt widths, including the >=32-row prefill shape.
+    if (backend_ctx->gpu_family != GPU_FAMILY::HAWAII &&
+        src1t == GGML_TYPE_F32 &&
         ne00 % 16 == 0 &&
         ne11 > 1 &&
         !(a7x_f32lm_bypass && src0t == GGML_TYPE_F32 && ne11 > 8 &&
@@ -24569,7 +24864,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             if (backend_ctx->gpu_family == INTEL) {
                 nth0 = 32;
                 nth1 = 1;
-            } else if (backend_ctx->gpu_family == ADRENO) {
+            } else if (backend_ctx->gpu_family == ADRENO || backend_ctx->gpu_family == HAWAII) {
                 nth0 = 64;
                 nth1 = 1;
             } else {
@@ -24606,7 +24901,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             if (backend_ctx->gpu_family == INTEL) {
                 nth0 = 32;
                 nth1 = 1;
-            } else if (backend_ctx->gpu_family == ADRENO) {
+            } else if (backend_ctx->gpu_family == ADRENO || backend_ctx->gpu_family == HAWAII) {
                 nth0 = 64;
                 nth1 = 1;
             } else {
@@ -25265,7 +25560,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 nth0 = 16;
                 nth1 = 1;
                 ndst = 16; // 8->16 rows per subgroup — matches N_DST in mul_mv_q4_k_f32_flat.cl (32 spills)
-            } else if (backend_ctx->gpu_family == ADRENO) {
+            } else if (backend_ctx->gpu_family == ADRENO || backend_ctx->gpu_family == HAWAII) {
                 nth0 = 64;
                 nth1 = 2;
                 ndst = 16;
@@ -25874,6 +26169,8 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
     const int ne2 = dst->ne[2];
 
     GGML_UNUSED(ne2);
+    const cl_ulong nb1 = dst->nb[1];
+    const cl_ulong nb2 = dst->nb[2];
 
     const int r2 = ne12/ne02;
     const int r3 = ne13/ne03;
@@ -27076,6 +27373,38 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
             break;
         }
         case GGML_TYPE_Q4_K: {
+            if (backend_ctx->gpu_family == GPU_FAMILY::HAWAII) {
+                kernel = backend_ctx->kernel_mul_mat_id_q4_K_f32_hawaii;
+                int arg_idx = 0;
+                CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),   &extra0_q4_K->q));
+                CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),   &extra0_q4_K->s));
+                CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),   &extra0_q4_K->d));
+                CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),   &extra0_q4_K->dm));
+                CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),   &extra1->data_device));
+                CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_ulong), &offset1));
+                CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),   &extra2->data_device));
+                CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_ulong), &offset2));
+                CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_mem),   &extrad->data_device));
+                CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_ulong), &offsetd));
+                CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),      &ne00));
+                CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),      &ne01));
+                CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),      &ne02));
+                CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),      &ne11));
+                CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),      &ne12));
+                CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),      &ne20));
+                CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),      &ne21));
+                CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_ulong), &nb11));
+                CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_ulong), &nb12));
+                CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_ulong), &nb20));
+                CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_ulong), &nb21));
+                CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_ulong), &nb1));
+                CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(cl_ulong), &nb2));
+                CL_CHECK(clSetKernelArg(kernel, arg_idx++, sizeof(int),      &ne0));
+                size_t global_size[3] = {(size_t) ne0, (size_t) ne20, (size_t) ne21};
+                size_t local_size[3] = {1, 1, 1};
+                backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_size, local_size, dst);
+                return;
+            }
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
             if (use_adreno_moe_kernels(backend_ctx, src0)) {
                 cl_int status;
@@ -28676,7 +29005,7 @@ static void ggml_cl_soft_max(ggml_backend_t backend, const ggml_tensor * src0, c
         // This is the same as the initial value.
         nth = MIN(32, ne00);
     }
-    else if (backend_ctx->gpu_family == ADRENO) {
+    else if (backend_ctx->gpu_family == ADRENO || backend_ctx->gpu_family == HAWAII) {
         nth = 64;
     } else {
         GGML_ASSERT(false && "TODO: Unknown GPU");
